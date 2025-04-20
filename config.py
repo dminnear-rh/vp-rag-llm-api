@@ -3,7 +3,7 @@ import logging
 import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, Optional
+from typing import Dict
 
 from dotenv import load_dotenv
 
@@ -18,7 +18,6 @@ class ModelType(str, Enum):
 class ModelConfig:
     name: str
     url: str
-    api_key: Optional[str]
     model_type: ModelType
     max_total_tokens: int
 
@@ -30,6 +29,7 @@ class AppConfig:
     models: Dict[str, ModelConfig]
     default_model: str
     log_level: int
+    openai_api_key: str
 
     @staticmethod
     def _get_required_env_var(key: str) -> str:
@@ -66,7 +66,6 @@ class AppConfig:
                 config = ModelConfig(
                     name=model["name"],
                     url=model["url"],
-                    api_key=model.get("api_key"),
                     model_type=ModelType(model["model_type"]),
                     max_total_tokens=int(model["max_total_tokens"]),
                 )
@@ -86,15 +85,16 @@ class AppConfig:
 
         qdrant_url = AppConfig._get_required_env_var("QDRANT_URL")
         qdrant_collection = AppConfig._get_required_env_var("QDRANT_COLLECTION")
+        default_model = AppConfig._get_required_env_var("DEFAULT_MODEL")
         models = AppConfig._parse_model_registry(
             AppConfig._get_required_env_var("VLLM_MODELS")
         )
-        default_model = AppConfig._get_required_env_var("DEFAULT_MODEL")
-
         if default_model not in models:
             raise ValueError(
                 f"DEFAULT_MODEL '{default_model}' not found in VLLM_MODELS list"
             )
+
+        openai_api_key = os.getenv("OPENAI_API_KEY", "")
 
         return AppConfig(
             qdrant_url=qdrant_url,
@@ -102,4 +102,5 @@ class AppConfig:
             models=models,
             default_model=default_model,
             log_level=log_level,
+            openai_api_key=openai_api_key,
         )

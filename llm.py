@@ -1,8 +1,6 @@
 import json
-
 import httpx
 import openai
-
 from config import AppConfig
 
 
@@ -75,28 +73,21 @@ async def stream_completion(config: AppConfig, model_name: str, messages: list[d
     elif model.model_type == "openai":
         openai.api_key = model.api_key
 
-        # OpenAI uses a sync generator even though our API is async
-        def generate():
-            response = openai.ChatCompletion.create(
-                model=model_name,
-                messages=messages,
-                max_tokens=3072,
-                temperature=0.5,
-                top_p=0.9,
-                stream=True,
-            )
-            for chunk in response:
-                delta = chunk["choices"][0].get("delta", {})
-                if "content" in delta:
-                    yield f"data: {json.dumps({'content': delta['content']})}\n"
-            yield "data: [DONE]\n"
+        response = openai.ChatCompletion.create(
+            model=model_name,
+            messages=messages,
+            max_tokens=3072,
+            temperature=0.5,
+            top_p=0.9,
+            stream=True,
+        )
 
-        # Wrap sync generator for async FastAPI usage
-        async def async_generator():
-            for chunk in generate():
-                yield chunk
+        for chunk in response:
+            delta = chunk["choices"][0].get("delta", {})
+            if "content" in delta:
+                yield f"data: {json.dumps({'content': delta['content']})}\n"
 
-        return async_generator()
+        yield "data: [DONE]\n"
 
     else:
         raise ValueError(f"Unsupported model type: {model.model_type}")

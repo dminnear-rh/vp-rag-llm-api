@@ -1,12 +1,29 @@
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
+
 from llm import get_completion, stream_completion
+from models import RAGRequest
 from retrieval import build_messages, get_context
 from utils import count_tokens
 
-from models import RAGRequest
-
 router = APIRouter()
+
+
+@router.get("/models")
+async def list_models(request: Request):
+    config = request.app.state.config
+    return {
+        "default_model": config.default_model,
+        "models": [
+            {
+                "name": m.name,
+                "model_type": m.model_type,
+                "url": m.url,
+                "max_total_tokens": m.max_total_tokens,
+            }
+            for m in config.models.values()
+        ],
+    }
 
 
 @router.post("/rag-query")

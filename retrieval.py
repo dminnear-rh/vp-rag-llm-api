@@ -8,25 +8,25 @@ from utils import count_tokens
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------
+# Vector-store retrieval + neighbour expansion
+# ---------------------------------------------------------------------
 
-# ---------------------------------------------------------------------
-# Vector-store retrieval + re-ranking
-# ---------------------------------------------------------------------
+
 def get_context(
     config: AppConfig,
     query: str,
     limit: int = 60,
-    top_n: int = 10,
+    top_n: int = 12,
 ) -> List[str]:
-    """
-    1. Embed query
-    2. Similarity search in Qdrant
-    3. Cross-encoder re-rank
-    4. Return top-N passage strings
-    """
+    """Return top passages plus immediate neighbours for richer context."""
+
     logger.debug(
-        f"🔍 get_context(collection={config.qdrant_collection!r}, "
-        f"limit={limit}, top_n={top_n}) - query={query!r}"
+        "🔍 get_context(collection=%r, limit=%d, top_n=%d) – query=%r",
+        config.qdrant_collection,
+        limit,
+        top_n,
+        query,
     )
 
     # 1️⃣ Embed query
@@ -34,61 +34,75 @@ def get_context(
         f"query: {query}", normalize_embeddings=True
     ).tolist()
     logger.debug(
-        f"🧩 Embedded query - dim={len(embedded_query)}, "
-        f"first5={embedded_query[:5]}"
+        "🧩 Embedded query dim=%d first5=%s", len(embedded_query), embedded_query[:5]
     )
 
     # 2️⃣ Similarity search
     qdrant = QdrantClient(url=config.qdrant_url)
-    search_result = qdrant.search(
+    hits = qdrant.search(
         collection_name=config.qdrant_collection,
         query_vector=embedded_query,
         limit=limit,
     )
-    logger.debug(f"🗂  Qdrant returned {len(search_result)} hits")
-
-    if not search_result:
-        logger.warning("⚠️  Qdrant search returned no hits at all")
+    logger.debug("🗂  Qdrant returned %d hits", len(hits))
+    if not hits:
+        logger.warning("⚠️  No vector hits returned from Qdrant")
         return []
 
-    # Extract text from payload.  Fallback if the key isn't literally "text".
-    docs: list[str] = []
-    for i, hit in enumerate(search_result):
+    # Map idx → text
+    idx_to_text: dict[int, str] = {}
+    for idx, hit in enumerate(hits):
         payload = hit.payload or {}
-        # Most ingest pipelines store passage text under one of these keys
         text = (
             payload.get("text")
             or payload.get("content")
             or payload.get("chunk")
-            or " ".join(str(v) for v in payload.values() if isinstance(v, str))
+            or " ".join(v for v in payload.values() if isinstance(v, str))
         )
-        docs.append(text)
-        logger.debug(f"    • Hit #{i:02d}  score={hit.score:.4f}  len={len(text)}")
+        idx_to_text[idx] = text
+        logger.debug("    • Hit #%02d  score=%.4f  len=%d", idx, hit.score, len(text))
 
-    # 3️⃣ Cross-encoder re-rank (optional)
-    if hasattr(config, "cross_encoder") and config.cross_encoder is not None:
-        pairs = [(query, doc) for doc in docs]
-        scores = config.cross_encoder.predict(pairs)
-        reranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
+    # 3️⃣ Cross-encoder re-rank (if configured)
+    scored_pairs = [(1.0, txt, i) for i, txt in idx_to_text.items()]
+    if getattr(config, "cross_encoder", None):
+        ce_scores = config.cross_encoder.predict(
+            [(query, t) for t in idx_to_text.values()]
+        )
+        scored_pairs = [
+            (s, t, i)
+            for (s, t), i in zip(
+                zip(ce_scores, idx_to_text.values()), idx_to_text.keys()
+            )
+        ]
         logger.debug(
-            "🤖 Cross-encoder scores (top-5): "
-            + ", ".join(f"{s:.3f}" for s, _ in reranked[:5])
+            "🤖 Cross-encoder top-5: %s",
+            ", ".join(f"{s:.3f}" for s, _, _ in sorted(scored_pairs, reverse=True)[:5]),
         )
-        docs = [doc for _, doc in reranked]
 
-    # 4️⃣ Return top-N
-    top_docs = docs[:top_n]
+    # 4️⃣ Select top-N indices and include neighbours (idx±1)
+    scored_pairs.sort(key=lambda x: x[0], reverse=True)
+    primary_idxs = [i for _, _, i in scored_pairs[:top_n]]
+    neighbour_idxs = {i - 1 for i in primary_idxs if i - 1 >= 0} | {
+        i + 1 for i in primary_idxs if i + 1 < len(hits)
+    }
+    final_idxs = sorted(set(primary_idxs) | neighbour_idxs)
+
+    docs = [idx_to_text[i] for i in final_idxs]
     logger.debug(
-        "📚 Returning %d docs. Combined context length = %d chars",
-        len(top_docs),
-        sum(len(d) for d in top_docs),
+        "📚 Returning %d docs (with neighbours). Combined chars=%d",
+        len(docs),
+        sum(len(d) for d in docs),
     )
-    return top_docs
+
+    # Cap the number of chunks to prevent oversized prompts
+    return docs[: top_n * 3]
 
 
 # ---------------------------------------------------------------------
 # Prompt construction
 # ---------------------------------------------------------------------
+
+
 def build_messages(
     question: str, retrieved_docs: list[str], history: list[str]
 ) -> list[dict]:
@@ -97,7 +111,7 @@ def build_messages(
     system_message = (
         "You are an expert in Red Hat OpenShift and Kubernetes application architecture, "
         "specializing in the design, implementation, and validation of OpenShift Validated Patterns.\n\n"
-        "The user is seeking to better understand OpenShift Validated Patterns — including how they are built, "
+        "The user is seeking to better understand Validated Patterns — including how they are built, "
         "tested, used across industries, or extended for new use cases. Use the following documentation and source "
         "content to generate a clear and practical answer.\n\n"
         "Your response should:\n"
@@ -110,13 +124,14 @@ def build_messages(
         {"role": "system", "content": system_message},
         {"role": "user", "content": f"Context:\n{context}"},
     ]
-
     return trim_history_for_tokens(base, history, question, max_tokens=25_000)
 
 
 # ---------------------------------------------------------------------
 # History-trimming helper
 # ---------------------------------------------------------------------
+
+
 def trim_history_for_tokens(
     messages: list[dict], history: list[str], question: str, max_tokens: int
 ) -> list[dict]:
@@ -129,7 +144,6 @@ def trim_history_for_tokens(
             )
             > max_tokens
         ):
-            # Remove the oldest user-supplied context (index 2) to stay under the cap
             messages.pop(2)
             break
     messages.append({"role": "user", "content": f"Question: {question}"})

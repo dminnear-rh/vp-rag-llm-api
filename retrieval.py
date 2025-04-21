@@ -1,6 +1,7 @@
 import logging
-from typing import List
+from typing import Dict, List
 
+import numpy as np
 from qdrant_client import QdrantClient
 
 from config import AppConfig
@@ -8,9 +9,39 @@ from utils import count_tokens
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------
-# Vector-store retrieval + neighbour expansion
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------------
+# Small helpers for Max-Marginal Relevance (MMR)
+# ------------------------------------------------------------------
+
+
+def _cos(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
+
+
+def _mmr_order(
+    vecs: Dict[int, np.ndarray], scores: Dict[int, float], lambda_param: float = 0.2
+) -> List[int]:
+    """Return indices ordered by Max Marginal Relevance."""
+    selected: List[int] = []
+    candidates = set(vecs.keys())
+
+    while candidates:
+        if not selected:
+            best = max(candidates, key=lambda i: scores[i])
+        else:
+            best = max(
+                candidates,
+                key=lambda i: lambda_param * scores[i]
+                - (1 - lambda_param) * max(_cos(vecs[i], vecs[j]) for j in selected),
+            )
+        selected.append(best)
+        candidates.remove(best)
+    return selected
+
+
+# ------------------------------------------------------------------
+# Vector-store retrieval with neighbour expansion + MMR
+# ------------------------------------------------------------------
 
 
 def get_context(
@@ -20,16 +51,10 @@ def get_context(
     top_n: int = 15,
     neighbor_window: int = 2,
 ) -> List[str]:
-    """Return a *deduplicated* list of passages plus neighbours.
-
-    * ``limit`` - how many vectors to pull from Qdrant initially.
-    * ``top_n`` - how many chunks to take after re-ranking.
-    * ``neighbor_window`` - include ``±window`` surrounding chunks for
-      additional context from the same document.
-    """
+    """Return deduplicated passages + neighbours using MMR for diversity."""
 
     logger.debug(
-        "🔍 get_context(collection=%r, limit=%d, top_n=%d, window=%d) - query=%r",
+        "🔍 get_context(collection=%r, limit=%d, top_n=%d, window=%d) – query=%r",
         config.qdrant_collection,
         limit,
         top_n,
@@ -40,22 +65,24 @@ def get_context(
     # 1️⃣ Embed query
     embedded_query = config.embedder.encode(
         f"query: {query}", normalize_embeddings=True
-    ).tolist()
+    )
 
     # 2️⃣ Similarity search
     qdrant = QdrantClient(url=config.qdrant_url)
     hits = qdrant.search(
         collection_name=config.qdrant_collection,
-        query_vector=embedded_query,
+        query_vector=embedded_query.tolist(),
         limit=limit,
     )
     if not hits:
         logger.warning("⚠️  No vector hits returned from Qdrant")
         return []
 
-    # idx → (text, score)
-    idx_to_text: dict[int, str] = {}
-    idx_to_score: dict[int, float] = {}
+    # Build maps idx → {text, score, vec}
+    idx_to_text: Dict[int, str] = {}
+    idx_to_vec: Dict[int, np.ndarray] = {}
+    idx_to_score: Dict[int, float] = {}
+
     for idx, hit in enumerate(hits):
         payload = hit.payload or {}
         text = (
@@ -65,35 +92,50 @@ def get_context(
             or " ".join(v for v in payload.values() if isinstance(v, str))
         )
         idx_to_text[idx] = text
+        idx_to_vec[idx] = np.array(hit.vector, dtype=np.float32)
         idx_to_score[idx] = hit.score
 
-    # 3️⃣ Cross-encoder re-rank
-    scores = [idx_to_score[i] for i in range(len(idx_to_text))]  # default
+    # 3️⃣ Cross-encoder re-rank (optional)
     if getattr(config, "cross_encoder", None):
-        scores = config.cross_encoder.predict(
+        ce_scores = config.cross_encoder.predict(
             [(query, idx_to_text[i]) for i in range(len(idx_to_text))]
         )
-    ranked = sorted(range(len(idx_to_text)), key=lambda i: scores[i], reverse=True)
+        for i, s in enumerate(ce_scores):
+            idx_to_score[i] = float(s)
+        logger.debug(
+            "🤖 Cross-encoder top-5: %s",
+            ", ".join(
+                f"{idx_to_score[i]:.3f}"
+                for i in sorted(idx_to_score, key=idx_to_score.get, reverse=True)[:5]
+            ),
+        )
 
-    # 4️⃣ Collect primary + neighbour indices
+    # 4️⃣ MMR ordering for diversity
+    ranked = _mmr_order(idx_to_vec, idx_to_score, lambda_param=0.25)
+
+    # 5️⃣ Collect primary + neighbours
     primary = ranked[:top_n]
-    neighbours = {
+    neighbour_idxs = {
         j
         for i in primary
         for j in range(i - neighbor_window, i + neighbor_window + 1)
         if 0 <= j < len(idx_to_text)
     }
-    final_order = [i for i in ranked if i in neighbours]  # preserve CE order
+    final_order = [i for i in ranked if i in neighbour_idxs]
 
-    # 5️⃣ Deduplicate identical passages while preserving order
+    # 6️⃣ Deduplicate & add metadata prefix
     seen: set[str] = set()
-    docs: list[str] = []
+    docs: List[str] = []
     for i in final_order:
-        txt = idx_to_text[i].strip()
-        key = txt[:100]  # quick hash key (first 100chars)
-        if key not in seen:
-            seen.add(key)
-            docs.append(txt)
+        raw = idx_to_text[i].strip()
+        key = raw[:120]
+        if key in seen:
+            continue
+        seen.add(key)
+        meta = hits[i].payload or {}
+        title = meta.get("title") or meta.get("source")
+        prefix = f"### {title.split('/')[-1]}\n" if title else ""
+        docs.append(prefix + raw)
 
     logger.debug(
         "📚 Returning %d unique docs. Combined chars=%d",
@@ -103,9 +145,9 @@ def get_context(
     return docs
 
 
-# ---------------------------------------------------------------------
-# Prompt construction
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------------
+# Prompt construction (unchanged)
+# ------------------------------------------------------------------
 
 
 def build_messages(
@@ -132,9 +174,9 @@ def build_messages(
     return trim_history_for_tokens(base, history, question, max_tokens=25_000)
 
 
-# ---------------------------------------------------------------------
-# History-trimming helper
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------------
+# History-trimming helper (unchanged)
+# ------------------------------------------------------------------
 
 
 def trim_history_for_tokens(

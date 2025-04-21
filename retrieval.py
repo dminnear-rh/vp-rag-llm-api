@@ -15,8 +15,8 @@ logger = logging.getLogger(__name__)
 def get_context(
     config: AppConfig,
     query: str,
-    limit: int = 20,
-    top_n: int = 5,
+    limit: int = 60,
+    top_n: int = 10,
 ) -> List[str]:
     """
     1. Embed query

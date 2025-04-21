@@ -17,15 +17,23 @@ def get_context(
     config: AppConfig,
     query: str,
     limit: int = 60,
-    top_n: int = 12,
+    top_n: int = 15,
+    neighbor_window: int = 2,
 ) -> List[str]:
-    """Return top passages plus immediate neighbours for richer context."""
+    """Return a *deduplicated* list of passages plus neighbours.
+
+    * ``limit`` - how many vectors to pull from Qdrant initially.
+    * ``top_n`` - how many chunks to take after re-ranking.
+    * ``neighbor_window`` - include ``±window`` surrounding chunks for
+      additional context from the same document.
+    """
 
     logger.debug(
-        "🔍 get_context(collection=%r, limit=%d, top_n=%d) – query=%r",
+        "🔍 get_context(collection=%r, limit=%d, top_n=%d, window=%d) - query=%r",
         config.qdrant_collection,
         limit,
         top_n,
+        neighbor_window,
         query,
     )
 
@@ -33,9 +41,6 @@ def get_context(
     embedded_query = config.embedder.encode(
         f"query: {query}", normalize_embeddings=True
     ).tolist()
-    logger.debug(
-        "🧩 Embedded query dim=%d first5=%s", len(embedded_query), embedded_query[:5]
-    )
 
     # 2️⃣ Similarity search
     qdrant = QdrantClient(url=config.qdrant_url)
@@ -44,13 +49,13 @@ def get_context(
         query_vector=embedded_query,
         limit=limit,
     )
-    logger.debug("🗂  Qdrant returned %d hits", len(hits))
     if not hits:
         logger.warning("⚠️  No vector hits returned from Qdrant")
         return []
 
-    # Map idx → text
+    # idx → (text, score)
     idx_to_text: dict[int, str] = {}
+    idx_to_score: dict[int, float] = {}
     for idx, hit in enumerate(hits):
         payload = hit.payload or {}
         text = (
@@ -60,42 +65,42 @@ def get_context(
             or " ".join(v for v in payload.values() if isinstance(v, str))
         )
         idx_to_text[idx] = text
-        logger.debug("    • Hit #%02d  score=%.4f  len=%d", idx, hit.score, len(text))
+        idx_to_score[idx] = hit.score
 
-    # 3️⃣ Cross-encoder re-rank (if configured)
-    scored_pairs = [(1.0, txt, i) for i, txt in idx_to_text.items()]
+    # 3️⃣ Cross-encoder re-rank
+    scores = [idx_to_score[i] for i in range(len(idx_to_text))]  # default
     if getattr(config, "cross_encoder", None):
-        ce_scores = config.cross_encoder.predict(
-            [(query, t) for t in idx_to_text.values()]
+        scores = config.cross_encoder.predict(
+            [(query, idx_to_text[i]) for i in range(len(idx_to_text))]
         )
-        scored_pairs = [
-            (s, t, i)
-            for (s, t), i in zip(
-                zip(ce_scores, idx_to_text.values()), idx_to_text.keys()
-            )
-        ]
-        logger.debug(
-            "🤖 Cross-encoder top-5: %s",
-            ", ".join(f"{s:.3f}" for s, _, _ in sorted(scored_pairs, reverse=True)[:5]),
-        )
+    ranked = sorted(range(len(idx_to_text)), key=lambda i: scores[i], reverse=True)
 
-    # 4️⃣ Select top-N indices and include neighbours (idx±1)
-    scored_pairs.sort(key=lambda x: x[0], reverse=True)
-    primary_idxs = [i for _, _, i in scored_pairs[:top_n]]
-    neighbour_idxs = {i - 1 for i in primary_idxs if i - 1 >= 0} | {
-        i + 1 for i in primary_idxs if i + 1 < len(hits)
+    # 4️⃣ Collect primary + neighbour indices
+    primary = ranked[:top_n]
+    neighbours = {
+        j
+        for i in primary
+        for j in range(i - neighbor_window, i + neighbor_window + 1)
+        if 0 <= j < len(idx_to_text)
     }
-    final_idxs = sorted(set(primary_idxs) | neighbour_idxs)
+    final_order = [i for i in ranked if i in neighbours]  # preserve CE order
 
-    docs = [idx_to_text[i] for i in final_idxs]
+    # 5️⃣ Deduplicate identical passages while preserving order
+    seen: set[str] = set()
+    docs: list[str] = []
+    for i in final_order:
+        txt = idx_to_text[i].strip()
+        key = txt[:100]  # quick hash key (first 100chars)
+        if key not in seen:
+            seen.add(key)
+            docs.append(txt)
+
     logger.debug(
-        "📚 Returning %d docs (with neighbours). Combined chars=%d",
+        "📚 Returning %d unique docs. Combined chars=%d",
         len(docs),
         sum(len(d) for d in docs),
     )
-
-    # Cap the number of chunks to prevent oversized prompts
-    return docs[: top_n * 3]
+    return docs
 
 
 # ---------------------------------------------------------------------

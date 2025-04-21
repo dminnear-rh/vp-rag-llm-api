@@ -65,7 +65,7 @@ async def get_completion(
         response = client.chat.completions.create(
             model=model_name,
             messages=messages,
-            max_tokens=2048,
+            max_completion_tokens=2048,
             temperature=0.4,
             top_p=0.9,
         )
@@ -132,7 +132,7 @@ async def stream_completion(
         for chunk in client.chat.completions.create(
             model=model_name,
             messages=messages,
-            max_tokens=3072,
+            max_completion_tokens=3072,
             temperature=0.5,
             top_p=0.9,
             stream=True,

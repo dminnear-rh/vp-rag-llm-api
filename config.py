@@ -108,6 +108,6 @@ class AppConfig:
             default_model=default_model,
             log_level=log_level,
             openai_api_key=openai_api_key,
-            embedding_model=embedding_model,
+            embedder=embedding_model,
             cross_encoder=cross_encoder,
         )

@@ -6,6 +6,7 @@ from enum import Enum
 from typing import Dict
 
 from dotenv import load_dotenv
+from sentence_transformers import CrossEncoder, SentenceTransformer
 
 
 class ModelType(str, Enum):
@@ -30,6 +31,8 @@ class AppConfig:
     default_model: str
     log_level: int
     openai_api_key: str
+    embedder: SentenceTransformer
+    cross_encoder: CrossEncoder
 
     @staticmethod
     def _get_required_env_var(key: str) -> str:
@@ -77,24 +80,26 @@ class AppConfig:
     @staticmethod
     def load() -> "AppConfig":
         load_dotenv()
+        get = AppConfig._get_required_env_var
 
-        log_level = AppConfig._parse_log_level(os.getenv("LOG_LEVEL", "info").lower())
+        log_level = AppConfig._parse_log_level(get("LOG_LEVEL").lower())
         logging.basicConfig(level=log_level)
         logger = logging.getLogger(__name__)
         logger.debug("Logging initialized.")
 
-        qdrant_url = AppConfig._get_required_env_var("QDRANT_URL")
-        qdrant_collection = AppConfig._get_required_env_var("QDRANT_COLLECTION")
-        default_model = AppConfig._get_required_env_var("DEFAULT_MODEL")
-        models = AppConfig._parse_model_registry(
-            AppConfig._get_required_env_var("VLLM_MODELS")
-        )
+        qdrant_url = get("QDRANT_URL")
+        qdrant_collection = get("QDRANT_COLLECTION")
+        default_model = get("DEFAULT_MODEL")
+        models = AppConfig._parse_model_registry(get("VLLM_MODELS"))
         if default_model not in models:
             raise ValueError(
                 f"DEFAULT_MODEL '{default_model}' not found in VLLM_MODELS list"
             )
 
-        openai_api_key = os.getenv("OPENAI_API_KEY", "")
+        openai_api_key = get("OPENAI_API_KEY")
+
+        embedding_model = SentenceTransformer(get("EMBEDDING_MODEL"))
+        cross_encoder = CrossEncoder(get("CROSS_ENCODER_MODEL"))
 
         return AppConfig(
             qdrant_url=qdrant_url,
@@ -103,4 +108,6 @@ class AppConfig:
             default_model=default_model,
             log_level=log_level,
             openai_api_key=openai_api_key,
+            embedding_model=embedding_model,
+            cross_encoder=cross_encoder,
         )

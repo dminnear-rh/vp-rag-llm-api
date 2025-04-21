@@ -1,19 +1,15 @@
 from typing import List
 
 from qdrant_client import QdrantClient
-from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from config import AppConfig
-
-embedding_model = SentenceTransformer("BAAI/bge-large-en-v1.5")
-cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 
 def get_context(
     config: AppConfig, query: str, limit: int = 20, top_n: int = 5
 ) -> List[str]:
     qdrant = QdrantClient(url=config.qdrant_url)
-    embedded_query = embedding_model.encode(
+    embedded_query = config.embedder.encode(
         f"query: {query}", normalize_embeddings=True
     ).tolist()
 
@@ -24,7 +20,7 @@ def get_context(
     )
     docs = [hit.payload.get("text", "") for hit in search_result]
     pairs = [(query, doc) for doc in docs]
-    scores = cross_encoder.predict(pairs)
+    scores = config.cross_encoder.predict(pairs)
     reranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
 
     return [doc for _, doc in reranked[:top_n]]

@@ -1,5 +1,6 @@
 import json
 import logging
+from typing import AsyncGenerator
 
 import httpx
 import openai
@@ -10,16 +11,34 @@ from utils import count_tokens
 logger = logging.getLogger(__name__)
 
 
+# ------------------------------------------------------------
+# Shared helpers
+# ------------------------------------------------------------
+def _log_request(model_name: str, messages: list[dict], stream: bool = False):
+    tag = "[stream] " if stream else ""
+    logger.debug(
+        f"📝 {tag}Prompt sent to model '{model_name}':\n{json.dumps(messages, indent=2)}"
+    )
+    logger.info(f"📏 {tag}Tokens in request: {count_tokens(messages)}")
+
+
+def _log_response(model_name: str, answer: str, stream: bool = False):
+    tag = "[stream] " if stream else ""
+    logger.debug(f"🧠 {tag}Response from {model_name}:\n{answer}")
+    logger.info(
+        f"📏 {tag}Tokens in response: "
+        f"{count_tokens([{'role': 'assistant', 'content': answer}])}"
+    )
+
+
+# ------------------------------------------------------------
+# Non‑streaming
+# ------------------------------------------------------------
 async def get_completion(
     config: AppConfig, model_name: str, messages: list[dict]
 ) -> str:
     model = config.models[model_name]
-
-    logger.debug(
-        f"📝 Prompt sent to model '{model_name}':\n{json.dumps(messages, indent=2)}"
-    )
-    token_count = count_tokens(messages)
-    logger.info(f"📏 Tokens in request: {token_count}")
+    _log_request(model_name, messages)
 
     if model.model_type == "vllm":
         async with httpx.AsyncClient() as client:
@@ -34,42 +53,37 @@ async def get_completion(
                 },
             )
             resp.raise_for_status()
-            result = resp.json()
-            answer = result["choices"][0]["message"]["content"]
-            logger.debug(f"🧠 Response from vLLM:\n{answer}")
-            logger.info(
-                f"📏 Tokens in response: {count_tokens([{'role': 'assistant', 'content': answer}])}"
-            )
-            return answer
+            result = resp.json()["choices"][0]["message"]["content"]
+            _log_response("vLLM", result)
+            return result
 
     elif model.model_type == "openai":
         openai.api_key = config.openai_api_key
-        response = openai.ChatCompletion.create(
-            model=model_name,
-            messages=messages,
-            max_tokens=2048,
-            temperature=0.4,
-            top_p=0.9,
+        result = (
+            openai.ChatCompletion.create(
+                model=model_name,
+                messages=messages,
+                max_tokens=2048,
+                temperature=0.4,
+                top_p=0.9,
+            )
+            .choices[0]
+            .message["content"]
         )
-        result = response.choices[0].message["content"]
-        logger.debug(f"🧠 Response from OpenAI:\n{result}")
-        logger.info(
-            f"📏 Tokens in response: {count_tokens([{'role': 'assistant', 'content': result}])}"
-        )
+        _log_response("OpenAI", result)
         return result
 
-    else:
-        raise ValueError(f"Unsupported model type: {model.model_type}")
+    raise ValueError(f"Unsupported model type: {model.model_type}")
 
 
-async def stream_completion(config: AppConfig, model_name: str, messages: list[dict]):
+# ------------------------------------------------------------
+# Streaming
+# ------------------------------------------------------------
+async def stream_completion(
+    config: AppConfig, model_name: str, messages: list[dict]
+) -> AsyncGenerator[str, None]:
     model = config.models[model_name]
-
-    logger.debug(
-        f"📝 [stream] Prompt sent to model '{model_name}':\n{json.dumps(messages, indent=2)}"
-    )
-    token_count = count_tokens(messages)
-    logger.info(f"📏 [stream] Tokens in request: {token_count}")
+    _log_request(model_name, messages, stream=True)
 
     if model.model_type == "vllm":
         async with httpx.AsyncClient(timeout=None) as client:
@@ -85,33 +99,49 @@ async def stream_completion(config: AppConfig, model_name: str, messages: list[d
                     "stream": True,
                 },
             ) as r:
-                async for line in r.aiter_lines():
-                    if line.startswith("data: "):
-                        yield f"{line}\n"
+                full_resp = ""
+                async for raw in r.aiter_lines():
+                    if not raw or not raw.startswith("data: "):
+                        continue
 
-    elif model.model_type == "openai":
+                    payload = raw[6:]  # strip "data: "
+                    if payload.strip() == "[DONE]":
+                        yield "data: [DONE]\n"
+                        break
+
+                    try:
+                        obj = json.loads(payload)
+                        delta = obj["choices"][0].get("delta", {})
+                        if "content" in delta:
+                            token = delta["content"]
+                            full_resp += token
+                            # Normalized tiny chunk -> matches OpenAI branch
+                            yield f"data: {json.dumps({'content': token})}\n"
+                    except json.JSONDecodeError:
+                        continue  # ignore malformed keep‑alive lines
+
+                _log_response("vLLM", full_resp, stream=True)
+        return
+
+    if model.model_type == "openai":
         openai.api_key = config.openai_api_key
-        response = openai.ChatCompletion.create(
+        full_resp = ""
+        for chunk in openai.ChatCompletion.create(
             model=model_name,
             messages=messages,
             max_tokens=3072,
             temperature=0.5,
             top_p=0.9,
             stream=True,
-        )
-
-        full_response = ""
-        for chunk in response:
+        ):
             delta = chunk["choices"][0].get("delta", {})
             if "content" in delta:
-                full_response += delta["content"]
-                yield f"data: {json.dumps({'content': delta['content']})}\n"
+                token = delta["content"]
+                full_resp += token
+                yield f"data: {json.dumps({'content': token})}\n"
 
-        logger.debug(f"🧠 [stream] Full response:\n{full_response}")
-        logger.info(
-            f"📏 [stream] Tokens in response: {count_tokens([{'role': 'assistant', 'content': full_response}])}"
-        )
         yield "data: [DONE]\n"
+        _log_response("OpenAI", full_resp, stream=True)
+        return
 
-    else:
-        raise ValueError(f"Unsupported model type: {model.model_type}")
+    raise ValueError(f"Unsupported model type: {model.model_type}")

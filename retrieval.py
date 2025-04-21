@@ -1,9 +1,3 @@
-"""
-retrieval.py  –  choose 3-5 large passages for the prompt
-"""
-
-from __future__ import annotations
-
 import logging
 from collections import defaultdict
 from typing import Dict, List, Tuple
@@ -71,13 +65,13 @@ def get_context(
 
     # 2️⃣ similarity search
     client = QdrantClient(url=config.qdrant_url)
-    hits = client.search(
+    hits = client.query_points(
         collection_name=config.qdrant_collection,
-        query_vector=q_vec.tolist(),
+        query=q_vec.tolist(),
         limit=limit,
         with_vectors=True,
         with_payload=True,
-    )
+    ).points
     if not hits:
         logger.warning("⚠️  No hits from Qdrant")
         return []
@@ -89,7 +83,11 @@ def get_context(
 
     for rank, hit in enumerate(hits):
         meta = hit.payload or {}
-        doc_id = meta.get("source") or meta.get("title")
+        doc_id = (
+            meta.get("source")
+            or (meta.get("metadata") or {}).get("source")
+            or meta.get("title")
+        )
 
         # fallback: contiguous heuristic (same doc_x for idx neighbours)
         if not doc_id:
@@ -97,6 +95,7 @@ def get_context(
 
         text = (
             meta.get("text")
+            or meta.get("page_content")
             or meta.get("content")
             or meta.get("chunk")
             or " ".join(v for v in meta.values() if isinstance(v, str))

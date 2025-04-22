@@ -42,8 +42,8 @@ def get_context(
         )
     ranked = sorted(range(len(hits)), key=lambda i: scores[i], reverse=True)
 
-    # 2️⃣ Pick the best chunk from up‑to three different sources
-    PRIMARY_PER_SOURCE = 3  # how many distinct sources we want
+    # 2️⃣ Pick the best chunk from up‑to PRIMARY_PER_SOURCE different sources
+    PRIMARY_PER_SOURCE = 5  # how many distinct sources we want
     primaries: list[ScoredPoint] = []
     used_sources: set[str] = set()
 

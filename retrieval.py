@@ -1,9 +1,8 @@
 import logging
-from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import List
 
-import numpy as np
 from qdrant_client import QdrantClient
+from qdrant_client.conversions.common_types import ScoredPoint
 
 from config import AppConfig
 from utils import count_tokens
@@ -11,139 +10,90 @@ from utils import count_tokens
 logger = logging.getLogger(__name__)
 
 
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
-def _cos(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
-
-
-def _mmr(
-    vecs: Dict[str, np.ndarray],
-    scores: Dict[str, float],
-    k: int,
-    λ: float = 0.25,
-) -> List[str]:
-    picked: List[str] = []
-    cand = set(vecs)
-
-    while cand and len(picked) < k:
-        if not picked:
-            best = max(cand, key=lambda d: scores[d])
-        else:
-            best = max(
-                cand,
-                key=lambda d: λ * scores[d]
-                - (1 - λ) * max(_cos(vecs[d], vecs[p]) for p in picked),
-            )
-        picked.append(best)
-        cand.remove(best)
-    return picked
-
-
-# ------------------------------------------------------------------
-# Retrieval
-# ------------------------------------------------------------------
 def get_context(
     config: AppConfig,
     query: str,
-    *,
-    limit: int = 60,  # vector hits to fetch
-    doc_k: int = 4,  # how many *documents* to keep
-    max_ctx_tokens: int = 12_000,
+    limit: int = 60,
+    top_n: int = 5,
+    neighbor_window: int = 2,
 ) -> List[str]:
     logger.debug(
-        "🔍 get_context(coll=%r, limit=%d, doc_k=%d) – %r",
+        "🔍 get_context(coll=%r, limit=%d, doc_k=%d, win=%d) - %r",
         config.qdrant_collection,
         limit,
-        doc_k,
+        top_n,
+        neighbor_window,
         query,
     )
 
-    # 1️⃣ embed query
+    qclient = QdrantClient(url=config.qdrant_url)
     q_vec = config.embedder.encode(f"query: {query}", normalize_embeddings=True)
-
-    # 2️⃣ similarity search
-    client = QdrantClient(url=config.qdrant_url)
-    hits = client.query_points(
+    hits = qclient.query_points(
         collection_name=config.qdrant_collection,
         query=q_vec.tolist(),
         limit=limit,
-        with_vectors=True,
         with_payload=True,
     ).points
     if not hits:
-        logger.warning("⚠️  No hits from Qdrant")
         return []
 
-    # 3️⃣ organise hits by (preferred) doc_id
-    doc_chunks: Dict[str, List[Tuple[int, str]]] = defaultdict(list)
-    doc_vecs: Dict[str, np.ndarray] = {}
-    doc_scores: Dict[str, float] = {}
-
-    for rank, hit in enumerate(hits):
-        meta = hit.payload or {}
-        doc_id = (
-            meta.get("source")
-            or (meta.get("metadata") or {}).get("source")
-            or meta.get("title")
-        )
-
-        # fallback: contiguous heuristic (same doc_x for idx neighbours)
-        if not doc_id:
-            doc_id = f"doc_{rank//3}"  # every 3 adjacent points → same doc
-
-        text = (
-            meta.get("text")
-            or meta.get("page_content")
-            or meta.get("content")
-            or meta.get("chunk")
-            or " ".join(v for v in meta.values() if isinstance(v, str))
-        )
-
-        doc_chunks[doc_id].append((rank, text))
-        if doc_id not in doc_vecs:
-            doc_vecs[doc_id] = np.asarray(hit.vector, dtype=np.float32)
-            doc_scores[doc_id] = hit.score
-
-    # 4️⃣ optional cross-encoder rescoring
+    # 1️⃣ Cross‑encoder re‑rank (optional)
+    scores = [h.score for h in hits]
     if getattr(config, "cross_encoder", None):
-        ce_pairs = [
-            (query, " ".join(t for _, t in doc_chunks[d][:3])) for d in doc_chunks
-        ]
-        ce_scores = config.cross_encoder.predict(ce_pairs)
-        for d, s in zip(doc_chunks, ce_scores):
-            doc_scores[d] = float(s)
+        scores = config.cross_encoder.predict(
+            [(query, h.payload["page_content"]) for h in hits]
+        )
+    ranked = sorted(range(len(hits)), key=lambda i: scores[i], reverse=True)
 
-    # 5️⃣ pick K diverse docs with MMR
-    chosen_ids = _mmr(doc_vecs, doc_scores, k=doc_k, λ=0.25)
+    # 2️⃣ Pick top‑N primary chunks
+    primaries = [hits[i] for i in ranked[:top_n]]
 
-    # 6️⃣ merge chunks per doc, stop at token budget
-    results: List[str] = []
-    tok_total = 0
-    for d in chosen_ids:
-        body = "\n".join(t for _, t in sorted(doc_chunks[d]))
-        title = (d.split("/")[-1] if "/" in d else d).replace("doc_", "Document ")
-        passage = f"### {title}\n{body}".strip()
+    # 3️⃣ Expand ±window neighbours by index, then merge overlaps
+    neighbour_pts: list[ScoredPoint] = []
+    for p in primaries:
+        src, cid = p.payload["source"], p.payload["chunk_id"]
+        lo, hi = cid - neighbor_window, cid + neighbor_window
+        pts, _ = qclient.scroll(
+            collection_name=config.qdrant_collection,
+            scroll_filter={
+                "must": [
+                    {"key": "source", "match": {"value": src}},
+                    {"key": "chunk_id", "range": {"gte": lo, "lte": hi}},
+                ]
+            },
+            with_payload=True,
+        )
+        neighbour_pts.extend(pts)
 
-        n_tok = count_tokens([{"role": "user", "content": passage}])
-        if tok_total + n_tok > max_ctx_tokens:
-            break
-        results.append(passage)
-        tok_total += n_tok
+    # 4️⃣ Sort ⇒ iterate, merging consecutive chunks that overlap
+    neighbour_pts.sort(key=lambda p: (p.payload["source"], p.payload["chunk_id"]))
 
+    merged_docs: list[str] = []
+    buf, last_src, last_id = [], None, None
+    for p in neighbour_pts:
+        src, cid, txt = (p.payload[k] for k in ("source", "chunk_id", "page_content"))
+        if src == last_src and cid == last_id + 1:  # ‑‑ contiguous
+            #  tiny heuristic: drop prefix already present (overlap)
+            overlap = min(len(txt), config.chunk_overlap)
+            buf.append(txt[overlap:].lstrip())
+        else:
+            if buf:
+                merged_docs.append("\n".join(buf).strip())
+            buf = [txt]
+        last_src, last_id = src, cid
+    if buf:
+        merged_docs.append("\n".join(buf).strip())
+
+    token_total = count_tokens("\n".join(merged_docs))
     logger.debug(
-        "📚 %d docs | tokens=%d | chars=%d",
-        len(results),
-        tok_total,
-        sum(len(r) for r in results),
+        "📚 %d merged docs | tokens=%d | chars=%d",
+        len(merged_docs),
+        token_total,
+        sum(len(d) for d in merged_docs),
     )
-    return results
+    return merged_docs
 
 
-# ------------------------------------------------------------------
-# Prompt builder (unchanged)
-# ------------------------------------------------------------------
 def build_messages(
     question: str,
     retrieved_docs: List[str],
@@ -175,9 +125,6 @@ def build_messages(
     return _trim_history(base, history, question, max_prompt_tokens)
 
 
-# ------------------------------------------------------------------
-# History trimmer (unchanged)
-# ------------------------------------------------------------------
 def _trim_history(
     messages: List[dict],
     history: List[str],

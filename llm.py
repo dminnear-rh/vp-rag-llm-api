@@ -52,6 +52,7 @@ async def get_completion(
                     "temperature": 0.4,
                     "top_p": 0.9,
                 },
+                timeout=60,
             )
             resp.raise_for_status()
             result = resp.json()["choices"][0]["message"]["content"]

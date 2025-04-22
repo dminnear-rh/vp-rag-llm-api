@@ -14,14 +14,12 @@ def get_context(
     config: AppConfig,
     query: str,
     limit: int = 60,
-    top_n: int = 5,
-    neighbor_window: int = 2,
+    neighbor_window: int = 1,
 ) -> List[str]:
     logger.debug(
-        "🔍 get_context(coll=%r, limit=%d, doc_k=%d, win=%d) - %r",
+        "🔍 get_context(coll=%r, limit=%d, win=%d) - %r",
         config.qdrant_collection,
         limit,
-        top_n,
         neighbor_window,
         query,
     )
@@ -32,12 +30,11 @@ def get_context(
         collection_name=config.qdrant_collection,
         query=q_vec.tolist(),
         limit=limit,
-        with_payload=True,
     ).points
     if not hits:
         return []
 
-    # 1️⃣ Cross‑encoder re‑rank (optional)
+    # 1️⃣  Cross‑encoder re‑rank
     scores = [h.score for h in hits]
     if getattr(config, "cross_encoder", None):
         scores = config.cross_encoder.predict(
@@ -45,53 +42,59 @@ def get_context(
         )
     ranked = sorted(range(len(hits)), key=lambda i: scores[i], reverse=True)
 
-    # 2️⃣ Pick top‑N primary chunks
-    primaries = [hits[i] for i in ranked[:top_n]]
+    # 2️⃣ Pick the best chunk from up‑to three different sources
+    PRIMARY_PER_SOURCE = 3  # how many distinct sources we want
+    primaries: list[ScoredPoint] = []
+    used_sources: set[str] = set()
 
-    # 3️⃣ Expand ±window neighbours by index, then merge overlaps
+    for i in ranked:
+        p = hits[i]
+        src = p.payload["metadata"]["source"]
+        if src not in used_sources:
+            primaries.append(p)
+            used_sources.add(src)
+        if len(primaries) == PRIMARY_PER_SOURCE:
+            break
+    if not primaries:  # should never happen, but be safe
+        return []
+
+    # 3️⃣ For *each* primary, grab ±window neighbour chunks from the same source
     neighbour_pts: list[ScoredPoint] = []
     for p in primaries:
-        src, cid = p.payload["source"], p.payload["chunk_id"]
+        meta = p.payload["metadata"]
+        src, cid = meta["source"], meta["chunk_id"]
         lo, hi = cid - neighbor_window, cid + neighbor_window
+
         pts, _ = qclient.scroll(
             collection_name=config.qdrant_collection,
             scroll_filter={
                 "must": [
-                    {"key": "source", "match": {"value": src}},
-                    {"key": "chunk_id", "range": {"gte": lo, "lte": hi}},
+                    {"key": "metadata.source", "match": {"value": src}},
+                    {"key": "metadata.chunk_id", "range": {"gte": lo, "lte": hi}},
                 ]
             },
             with_payload=True,
+            with_vectors=False,
         )
         neighbour_pts.extend(pts)
 
-    # 4️⃣ Sort ⇒ iterate, merging consecutive chunks that overlap
-    neighbour_pts.sort(key=lambda p: (p.payload["source"], p.payload["chunk_id"]))
-
-    merged_docs: list[str] = []
-    buf, last_src, last_id = [], None, None
-    for p in neighbour_pts:
-        src, cid, txt = (p.payload[k] for k in ("source", "chunk_id", "page_content"))
-        if src == last_src and cid == last_id + 1:  # ‑‑ contiguous
-            #  tiny heuristic: drop prefix already present (overlap)
-            overlap = min(len(txt), config.chunk_overlap)
-            buf.append(txt[overlap:].lstrip())
-        else:
-            if buf:
-                merged_docs.append("\n".join(buf).strip())
-            buf = [txt]
-        last_src, last_id = src, cid
-    if buf:
-        merged_docs.append("\n".join(buf).strip())
-
-    token_total = count_tokens("\n".join(merged_docs))
-    logger.debug(
-        "📚 %d merged docs | tokens=%d | chars=%d",
-        len(merged_docs),
-        token_total,
-        sum(len(d) for d in merged_docs),
+    # 4️⃣ Order by (source, chunk_id) and dedupe by text
+    neighbour_pts.sort(
+        key=lambda p: (
+            p.payload["metadata"]["source"],
+            p.payload["metadata"]["chunk_id"],
+        )
     )
-    return merged_docs
+    docs, seen = [], set()
+    for p in neighbour_pts:
+        txt = p.payload["page_content"].strip()
+        if txt and txt not in seen:
+            seen.add(txt)
+            docs.append(txt)
+            if len(docs) >= (PRIMARY_PER_SOURCE * (2 * neighbor_window + 1)):
+                break  # don't exceed 9 if window=1
+
+    return docs
 
 
 def build_messages(

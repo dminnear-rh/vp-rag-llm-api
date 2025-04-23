@@ -1,5 +1,6 @@
 import logging
-from typing import List
+from collections import defaultdict
+from typing import Dict, List, Set
 
 from qdrant_client import QdrantClient
 from qdrant_client.conversions.common_types import ScoredPoint
@@ -14,63 +15,96 @@ def get_context(
     config: AppConfig,
     query: str,
     limit: int = 60,
+    primary_k: int = 10,
     neighbor_window: int = 1,
+    per_source_max: int = 3,
+    min_rel_score: float = 0.55,
+    min_abs_score: float = 0.25,
 ) -> List[str]:
+    """
+    Retrieve up to *primary_k* highly-relevant chunks **plus** their ± *neighbor_window*
+    neighbours, with light source-level diversity.
+
+    Steps
+    -----
+    1. Dense-vector search → optional cross-encoder re-rank
+    2. Score/diversity filtering ⇒ *primaries*
+    3. Build a set of wanted (source, chunk_id ± window) pairs
+    4. One `scroll()` per source using a `match any=[…]` filter
+    5. Order by *(source, chunk_id)* and return unique texts
+    """
     logger.debug(
-        "🔍 get_context(coll=%r, limit=%d, win=%d) - %r",
+        "🔍 get_context(coll=%s, k=%d, win=%d, limit=%d) – %r",
         config.qdrant_collection,
-        limit,
+        primary_k,
         neighbor_window,
+        limit,
         query,
     )
 
+    # ── 1. Vector search ────────────────────────────────────────────────────
     qclient = QdrantClient(url=config.qdrant_url)
     q_vec = config.embedder.encode(f"query: {query}", normalize_embeddings=True)
-    hits = qclient.query_points(
+
+    search = qclient.query_points(
         collection_name=config.qdrant_collection,
         query=q_vec.tolist(),
         limit=limit,
+        with_payload=True,
+        with_vectors=False,
     ).points
-    if not hits:
+
+    if not search:
+        logger.warning("⚠️  No vector hits returned from Qdrant")
         return []
 
-    # 1️⃣  Cross‑encoder re‑rank
-    scores = [h.score for h in hits]
+    # ── 2. Optional cross-encoder re-rank ───────────────────────────────────
+    scores = [p.score for p in search]
     if getattr(config, "cross_encoder", None):
         scores = config.cross_encoder.predict(
-            [(query, h.payload["page_content"]) for h in hits]
+            [(query, p.payload["page_content"]) for p in search]
         )
-    ranked = sorted(range(len(hits)), key=lambda i: scores[i], reverse=True)
 
-    # 2️⃣ Pick the best chunk from up‑to PRIMARY_PER_SOURCE different sources
-    PRIMARY_PER_SOURCE = 5  # how many distinct sources we want
-    primaries: list[ScoredPoint] = []
-    used_sources: set[str] = set()
+    ranked_idx = sorted(range(len(search)), key=lambda i: scores[i], reverse=True)
+    top_score = scores[ranked_idx[0]]
 
-    for i in ranked:
-        p = hits[i]
+    # ── 3. Pick primary chunks (score-gated & per-source capped) ─────────────
+    primaries: List[ScoredPoint] = []
+    per_src_counter: Dict[str, int] = {}
+
+    for i in ranked_idx:
+        p = search[i]
         src = p.payload["metadata"]["source"]
-        if src not in used_sources:
-            primaries.append(p)
-            used_sources.add(src)
-        if len(primaries) == PRIMARY_PER_SOURCE:
-            break
-    if not primaries:  # should never happen, but be safe
-        return []
 
-    # 3️⃣ For *each* primary, grab ±window neighbour chunks from the same source
-    neighbour_pts: list[ScoredPoint] = []
+        if scores[i] < max(min_abs_score, top_score * min_rel_score):
+            continue
+        if per_src_counter.get(src, 0) >= per_source_max:
+            continue
+
+        primaries.append(p)
+        per_src_counter[src] = per_src_counter.get(src, 0) + 1
+        if len(primaries) == primary_k:
+            break
+
+    if not primaries:
+        primaries.append(search[ranked_idx[0]])
+
+    # ── 4. Build neighbour id-sets & fetch in one scroll per source ─────────
+    per_src_idset: Dict[str, Set[int]] = defaultdict(set)
     for p in primaries:
         meta = p.payload["metadata"]
         src, cid = meta["source"], meta["chunk_id"]
-        lo, hi = cid - neighbor_window, cid + neighbor_window
+        for n in range(cid - neighbor_window, cid + neighbor_window + 1):
+            per_src_idset[src].add(n)
 
+    neighbour_pts: List[ScoredPoint] = []
+    for src, idset in per_src_idset.items():
         pts, _ = qclient.scroll(
             collection_name=config.qdrant_collection,
             scroll_filter={
                 "must": [
                     {"key": "metadata.source", "match": {"value": src}},
-                    {"key": "metadata.chunk_id", "range": {"gte": lo, "lte": hi}},
+                    {"key": "metadata.chunk_id", "match": {"any": list(idset)}},
                 ]
             },
             with_payload=True,
@@ -78,22 +112,15 @@ def get_context(
         )
         neighbour_pts.extend(pts)
 
-    # 4️⃣ Order by (source, chunk_id) and dedupe by text
+    # ── 5. Order (source, chunk_id) & return  ────────────────────────────────
     neighbour_pts.sort(
         key=lambda p: (
             p.payload["metadata"]["source"],
             p.payload["metadata"]["chunk_id"],
         )
     )
-    docs, seen = [], set()
-    for p in neighbour_pts:
-        txt = p.payload["page_content"].strip()
-        if txt and txt not in seen:
-            seen.add(txt)
-            docs.append(txt)
-            if len(docs) >= (PRIMARY_PER_SOURCE * (2 * neighbor_window + 1)):
-                break  # don't exceed 9 if window=1
 
+    docs = [p.payload["page_content"].strip() for p in neighbour_pts]
     return docs
 
 
@@ -101,7 +128,6 @@ def build_messages(
     question: str,
     retrieved_docs: List[str],
     history: List[str],
-    *,
     max_prompt_tokens: int = 25_000,
 ) -> List[dict]:
     context = "\n---\n".join(retrieved_docs)

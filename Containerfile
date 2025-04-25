@@ -15,7 +15,7 @@ COPY models.py .
 COPY retrieval.py .
 COPY router.py .
 COPY utils.py .
-COPY entrypoint.sh
+COPY entrypoint.sh .
 
 RUN chown -R 1001:0 .
 

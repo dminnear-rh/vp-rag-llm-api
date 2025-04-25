@@ -1,12 +1,14 @@
+import logging
+
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
 from llm import get_completion, stream_completion
 from models import RAGRequest
-from retrieval import build_messages, get_context
-from utils import count_tokens
+from retrieval import build_messages
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.get("/models")
@@ -29,27 +31,25 @@ async def list_models(request: Request):
 @router.post("/rag-query")
 async def rag_query(request: Request, payload: RAGRequest):
     config = request.app.state.config
-    model_name = payload.model or config.default_model
-    context_chunks = get_context(config, payload.question)
-    messages = build_messages(payload.question, context_chunks, payload.history)
+    try:
+        model = config.models[payload.model]
+    except:
+        model = config.models[config.default_model]
+    messages = build_messages(config, model, payload.question, payload.history)
 
-    prompt_tokens = count_tokens(messages)
-    print(f"Prompt tokens: {prompt_tokens}")
-
-    answer = await get_completion(config, model_name, messages)
+    answer = await get_completion(config, model, messages)
     return {"answer": answer}
 
 
 @router.post("/rag-query/stream")
 async def rag_query_stream(request: Request, payload: RAGRequest):
     config = request.app.state.config
-    model_name = payload.model or config.default_model
-    context_chunks = get_context(config, payload.question)
-    messages = build_messages(payload.question, context_chunks, payload.history)
-
-    prompt_tokens = count_tokens(messages)
-    print(f"[stream] Prompt tokens: {prompt_tokens}")
+    try:
+        model = config.models[payload.model]
+    except:
+        model = config.models[config.default_model]
+    messages = build_messages(config, model, payload.question, payload.history)
 
     return StreamingResponse(
-        stream_completion(config, model_name, messages), media_type="text/event-stream"
+        stream_completion(config, model, messages), media_type="text/event-stream"
     )

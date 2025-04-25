@@ -5,7 +5,7 @@ from typing import AsyncGenerator
 import httpx
 from openai import OpenAI
 
-from config import AppConfig
+from config import AppConfig, ModelConfig
 from utils import count_tokens
 
 logger = logging.getLogger(__name__)
@@ -14,20 +14,20 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------
-def _log_request(model_name: str, messages: list[dict], stream: bool = False):
+def _log_request(model: ModelConfig, messages: list[dict], stream: bool = False):
     tag = "[stream] " if stream else ""
     logger.debug(
-        f"📝 {tag}Prompt sent to model '{model_name}':\n{json.dumps(messages, indent=2)}"
+        f"📝 {tag}Prompt sent to model '{model.name}':\n{json.dumps(messages, indent=2)}"
     )
-    logger.info(f"📏 {tag}Tokens in request: {count_tokens(messages)}")
+    logger.info(f"📏 {tag}Tokens in request: {count_tokens(model, messages)}")
 
 
-def _log_response(model_name: str, answer: str, stream: bool = False):
+def _log_response(model: ModelConfig, answer: str, stream: bool = False):
     tag = "[stream] " if stream else ""
-    logger.debug(f"🧠 {tag}Response from {model_name}:\n{answer}")
+    logger.debug(f"🧠 {tag}Response from {model.name}:\n{answer}")
     logger.info(
         f"📏 {tag}Tokens in response: "
-        f"{count_tokens([{'role': 'assistant', 'content': answer}])}"
+        f"{count_tokens(model, [{'role': 'assistant', 'content': answer}])}"
     )
 
 
@@ -35,10 +35,9 @@ def _log_response(model_name: str, answer: str, stream: bool = False):
 # Non‑streaming
 # ---------------------------------------------------------------------
 async def get_completion(
-    config: AppConfig, model_name: str, messages: list[dict]
+    config: AppConfig, model: ModelConfig, messages: list[dict]
 ) -> str:
-    model = config.models[model_name]
-    _log_request(model_name, messages)
+    _log_request(model, messages)
 
     # -------- vLLM ----------------------------------------------------
     if model.model_type == "vllm":
@@ -46,17 +45,17 @@ async def get_completion(
             resp = await client.post(
                 f"{model.url}/v1/chat/completions",
                 json={
-                    "model": model_name,
+                    "model": model.name,
                     "messages": messages,
-                    "max_tokens": 2048,
+                    "max_tokens": config.max_response_tokens,
                     "temperature": 0.4,
                     "top_p": 0.9,
                 },
-                timeout=60,
+                timeout=120,
             )
             resp.raise_for_status()
             result = resp.json()["choices"][0]["message"]["content"]
-            _log_response("vLLM", result)
+            _log_response(model, result)
             return result
 
     # -------- OpenAI --------------------------------------------------
@@ -64,14 +63,14 @@ async def get_completion(
         client = OpenAI(api_key=config.openai_api_key)
 
         response = client.chat.completions.create(
-            model=model_name,
+            model=model.name,
             messages=messages,
-            max_completion_tokens=2048,
+            max_completion_tokens=config.max_response_tokens,
             temperature=0.4,
             top_p=0.9,
         )
         result = response.choices[0].message.content
-        _log_response("OpenAI", result)
+        _log_response(model, result)
         return result
 
     raise ValueError(f"Unsupported model type: {model.model_type}")
@@ -81,10 +80,9 @@ async def get_completion(
 # Streaming
 # ---------------------------------------------------------------------
 async def stream_completion(
-    config: AppConfig, model_name: str, messages: list[dict]
+    config: AppConfig, model: ModelConfig, messages: list[dict]
 ) -> AsyncGenerator[str, None]:
-    model = config.models[model_name]
-    _log_request(model_name, messages, stream=True)
+    _log_request(model, messages, stream=True)
 
     # -------- vLLM ----------------------------------------------------
     if model.model_type == "vllm":
@@ -93,9 +91,9 @@ async def stream_completion(
                 "POST",
                 f"{model.url}/v1/chat/completions",
                 json={
-                    "model": model_name,
+                    "model": model.name,
                     "messages": messages,
-                    "max_tokens": 3072,
+                    "max_tokens": config.max_response_tokens,
                     "temperature": 0.5,
                     "top_p": 0.9,
                     "stream": True,
@@ -121,7 +119,7 @@ async def stream_completion(
                     except json.JSONDecodeError:
                         continue  # ignore malformed keep‑alive lines
 
-                _log_response("vLLM", full_resp, stream=True)
+                _log_response(model, full_resp, stream=True)
         return
 
     # -------- OpenAI --------------------------------------------------
@@ -131,9 +129,9 @@ async def stream_completion(
 
         # new‑style streaming generator
         for chunk in client.chat.completions.create(
-            model=model_name,
+            model=model.name,
             messages=messages,
-            max_completion_tokens=3072,
+            max_completion_tokens=config.max_response_tokens,
             temperature=0.5,
             top_p=0.9,
             stream=True,
@@ -145,7 +143,7 @@ async def stream_completion(
                 yield f"data: {json.dumps({'content': token})}\n"
 
         yield "data: [DONE]\n"
-        _log_response("OpenAI", full_resp, stream=True)
+        _log_response(model, full_resp, stream=True)
         return
 
     raise ValueError(f"Unsupported model type: {model.model_type}")

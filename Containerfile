@@ -15,9 +15,10 @@ COPY models.py .
 COPY retrieval.py .
 COPY router.py .
 COPY utils.py .
+COPY entrypoint.sh
 
 RUN chown -R 1001:0 .
 
 USER 1001
 
-CMD ["uvicorn", "main:app", "--host=0.0.0.0", "--port=8080"]
+CMD ./entrypoint.sh

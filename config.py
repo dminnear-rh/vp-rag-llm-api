@@ -12,7 +12,6 @@ from sentence_transformers import CrossEncoder, SentenceTransformer
 class ModelType(str, Enum):
     VLLM = "vllm"
     OPENAI = "openai"
-    ANTHROPIC = "anthropic"
 
 
 @dataclass
@@ -33,6 +32,8 @@ class AppConfig:
     openai_api_key: str
     embedder: SentenceTransformer
     cross_encoder: CrossEncoder
+    system_message: str
+    max_response_tokens: int
 
     @staticmethod
     def _get_required_env_var(key: str) -> str:
@@ -101,6 +102,9 @@ class AppConfig:
         embedding_model = SentenceTransformer(get("EMBEDDING_MODEL"))
         cross_encoder = CrossEncoder(get("CROSS_ENCODER_MODEL"))
 
+        system_message = get("SYSTEM_MESSAGE")
+        max_response_tokens = int(get("MAX_RESPONSE_TOKENS"))
+
         return AppConfig(
             qdrant_url=qdrant_url,
             qdrant_collection=qdrant_collection,
@@ -110,4 +114,6 @@ class AppConfig:
             openai_api_key=openai_api_key,
             embedder=embedding_model,
             cross_encoder=cross_encoder,
+            system_message=system_message,
+            max_response_tokens=max_response_tokens,
         )

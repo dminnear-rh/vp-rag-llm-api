@@ -1,48 +1,24 @@
 import logging
-from collections import defaultdict
-from typing import Dict, List, Set
+from typing import List, Set
 
 from qdrant_client import QdrantClient
 from qdrant_client.conversions.common_types import ScoredPoint
 
-from config import AppConfig
+from config import AppConfig, ModelConfig
 from utils import count_tokens
 
 logger = logging.getLogger(__name__)
 
 
-def get_context(
+def _get_context(
     config: AppConfig,
+    model: ModelConfig,
     query: str,
+    max_tokens: int,
     limit: int = 60,
     primary_k: int = 10,
-    neighbor_window: int = 1,
-    per_source_max: int = 3,
-    min_rel_score: float = 0.55,
-    min_abs_score: float = 0.25,
-) -> List[str]:
-    """
-    Retrieve up to *primary_k* highly-relevant chunks **plus** their ± *neighbor_window*
-    neighbours, with light source-level diversity.
-
-    Steps
-    -----
-    1. Dense-vector search → optional cross-encoder re-rank
-    2. Score/diversity filtering ⇒ *primaries*
-    3. Build a set of wanted (source, chunk_id ± window) pairs
-    4. One `scroll()` per source using a `match any=[…]` filter
-    5. Order by *(source, chunk_id)* and return unique texts
-    """
-    logger.debug(
-        "🔍 get_context(coll=%s, k=%d, win=%d, limit=%d) – %r",
-        config.qdrant_collection,
-        primary_k,
-        neighbor_window,
-        limit,
-        query,
-    )
-
-    # ── 1. Vector search ────────────────────────────────────────────────────
+) -> dict:
+    # Vector search
     qclient = QdrantClient(url=config.qdrant_url)
     q_vec = config.embedder.encode(f"query: {query}", normalize_embeddings=True)
 
@@ -50,15 +26,13 @@ def get_context(
         collection_name=config.qdrant_collection,
         query=q_vec.tolist(),
         limit=limit,
-        with_payload=True,
-        with_vectors=False,
     ).points
 
     if not search:
         logger.warning("⚠️  No vector hits returned from Qdrant")
-        return []
+        return {"role": "user", "content": "No relevant documents found."}
 
-    # ── 2. Optional cross-encoder re-rank ───────────────────────────────────
+    # Cross-encoder re-rank
     scores = [p.score for p in search]
     if getattr(config, "cross_encoder", None):
         scores = config.cross_encoder.predict(
@@ -66,108 +40,100 @@ def get_context(
         )
 
     ranked_idx = sorted(range(len(search)), key=lambda i: scores[i], reverse=True)
-    top_score = scores[ranked_idx[0]]
 
-    # ── 3. Pick primary chunks (score-gated & per-source capped) ─────────────
-    primaries: List[ScoredPoint] = []
-    per_src_counter: Dict[str, int] = {}
+    # Pick primary_k top chunks
+    top_k = [search[ranked_idx[i]] for i in range(min(primary_k, len(search)))]
 
-    for i in ranked_idx:
-        p = search[i]
-        src = p.payload["metadata"]["source"]
+    # Get sources for top_k vectors
+    top_k_sources: Set[str] = set()
+    for p in top_k:
+        source = p.payload["metadata"]["source"]
+        top_k_sources.add(source)
 
-        if scores[i] < max(min_abs_score, top_score * min_rel_score):
-            continue
-        if per_src_counter.get(src, 0) >= per_source_max:
-            continue
-
-        primaries.append(p)
-        per_src_counter[src] = per_src_counter.get(src, 0) + 1
-        if len(primaries) == primary_k:
-            break
-
-    if not primaries:
-        primaries.append(search[ranked_idx[0]])
-
-    # ── 4. Build neighbour id-sets & fetch in one scroll per source ─────────
-    per_src_idset: Dict[str, Set[int]] = defaultdict(set)
-    for p in primaries:
-        meta = p.payload["metadata"]
-        src, cid = meta["source"], meta["chunk_id"]
-        for n in range(cid - neighbor_window, cid + neighbor_window + 1):
-            per_src_idset[src].add(n)
-
-    neighbour_pts: List[ScoredPoint] = []
-    for src, idset in per_src_idset.items():
-        pts, _ = qclient.scroll(
+    # Retrieve full source document for top_k_sources
+    top_k_contents: List[str] = []
+    for source in top_k_sources:
+        points, _ = qclient.scroll(
             collection_name=config.qdrant_collection,
             scroll_filter={
                 "must": [
-                    {"key": "metadata.source", "match": {"value": src}},
-                    {"key": "metadata.chunk_id", "match": {"any": list(idset)}},
+                    {"key": "metadata.source", "match": {"value": source}},
+                    {
+                        "key": "metadata.chunk_id",
+                        "range": {
+                            "gte": 0,
+                            "lte": 100,
+                        },
+                    },
                 ]
             },
-            with_payload=True,
-            with_vectors=False,
         )
-        neighbour_pts.extend(pts)
 
-    # ── 5. Order (source, chunk_id) & return  ────────────────────────────────
-    neighbour_pts.sort(
-        key=lambda p: (
-            p.payload["metadata"]["source"],
-            p.payload["metadata"]["chunk_id"],
-        )
-    )
+        # Sort by chunk_id
+        sorted_points = sorted(points, key=lambda p: p.payload["metadata"]["chunk_id"])
+        content = f"Source: {source}\n"
+        for point in sorted_points:
+            content += f"\n{point.payload['page_content']}"
+        top_k_contents.append(content)
 
-    docs = [p.payload["page_content"].strip() for p in neighbour_pts]
-    return docs
+    # Remove least relevant source docs if we overshoot max_tokens
+    def context_dict(context_docs: List[str]) -> dict:
+        context = "\n---\n".join(context_docs)
+        return {"role": "user", "content": f"## Context\n{context}"}
+
+    while count_tokens(model, [context_dict(top_k_contents)]) > max_tokens:
+        top_k_contents.pop()
+
+    return context_dict(top_k_contents)
 
 
 def build_messages(
+    config: AppConfig,
+    model: ModelConfig,
     question: str,
-    retrieved_docs: List[str],
     history: List[str],
-    max_prompt_tokens: int = 25_000,
 ) -> List[dict]:
-    context = "\n---\n".join(retrieved_docs)
-
-    system_msg = (
-        "You are an expert in Red Hat OpenShift and Kubernetes application "
-        "architecture, specializing in the design, implementation, and "
-        "validation of OpenShift Validated Patterns.\n\n"
-        "The user is seeking to better understand Validated Patterns — "
-        "including how they are built, tested, used across industries, or "
-        "extended for new use cases. Use the following documentation and "
-        "source content to generate a clear and practical answer.\n\n"
-        "Your response should:\n"
-        "- Reference relevant concepts or implementation details from the provided context\n"
-        "- Be technically accurate and aimed at architects, engineers, or contributors\n"
-        "- Include examples or explanations using OpenShift-native tools and practices "
-        "(e.g., GitOps, Operators, Pipelines, Secrets management)"
-    )
-
     base = [
-        {"role": "system", "content": system_msg},
-        {"role": "user", "content": f"Context:\n{context}"},
+        {"role": "system", "content": config.system_message},
     ]
-    return _trim_history(base, history, question, max_prompt_tokens)
+    user_question = {"role": "user", "content": f"Question: {question}"}
+
+    # Figure out how many tokens we can devote to context and history
+    base_tokens = count_tokens(model, base)
+    user_question_tokens = count_tokens(model, [user_question])
+    max_tokens = (
+        model.max_total_tokens
+        - base_tokens
+        - user_question_tokens
+        - config.max_response_tokens
+        - 100
+    )
+    max_context_tokens = int(0.7 * max_tokens)
+    max_history_tokens = max_tokens - max_context_tokens
+
+    history = _trim_history(model, history, max_history_tokens)
+    base.extend(history)
+
+    base.append(_get_context(config, model, question, max_context_tokens))
+
+    base.append(user_question)
+
+    return base
 
 
 def _trim_history(
-    messages: List[dict],
+    model: ModelConfig,
     history: List[str],
-    question: str,
     max_tokens: int,
 ) -> List[dict]:
-    msgs = messages.copy()
-    for turn in history:
-        msgs.append({"role": "user", "content": turn})
-        if (
-            count_tokens(msgs + [{"role": "user", "content": f"Question: {question}"}])
-            > max_tokens
-        ):
-            msgs.pop(2)
-            break
-    msgs.append({"role": "user", "content": f"Question: {question}"})
-    return msgs
+    # Alternate roles: user → assistant → user → assistant → ...
+    roles = ["user", "assistant"]
+    trimmed_history = [
+        {"role": roles[i % 2], "content": turn} for i, turn in enumerate(history)
+    ]
+
+    # Trim oldest messages
+    while count_tokens(model, trimmed_history) > max_tokens:
+        trimmed_history.pop(0)
+
+    return trimmed_history

@@ -6,4 +6,5 @@ qdrant-client
 requests
 sentence-transformers
 sentencepiece
+tiktoken
 uvicorn

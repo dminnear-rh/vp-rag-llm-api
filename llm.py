@@ -11,10 +11,15 @@ from utils import count_tokens
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------
 def _log_request(model: ModelConfig, messages: list[dict], stream: bool = False):
+    """
+    Log the request being sent to the model for debugging and traceability.
+
+    Args:
+        model: The model configuration being used.
+        messages: The list of messages sent to the LLM.
+        stream: Whether this is a streaming request.
+    """
     tag = "[stream] " if stream else ""
     logger.debug(
         f"📝 {tag}Prompt sent to model '{model.name}':\n{json.dumps(messages, indent=2)}"
@@ -23,6 +28,14 @@ def _log_request(model: ModelConfig, messages: list[dict], stream: bool = False)
 
 
 def _log_response(model: ModelConfig, answer: str, stream: bool = False):
+    """
+    Log the response returned from the model.
+
+    Args:
+        model: The model configuration used.
+        answer: The full text response.
+        stream: Whether this was a streaming response.
+    """
     tag = "[stream] " if stream else ""
     logger.debug(f"🧠 {tag}Response from {model.name}:\n{answer}")
     logger.info(
@@ -31,15 +44,27 @@ def _log_response(model: ModelConfig, answer: str, stream: bool = False):
     )
 
 
-# ---------------------------------------------------------------------
-# Non‑streaming
-# ---------------------------------------------------------------------
 async def get_completion(
     config: AppConfig, model: ModelConfig, messages: list[dict]
 ) -> str:
+    """
+    Send a non-streaming chat completion request to the specified model.
+
+    Supports both vLLM and OpenAI-compatible models.
+
+    Args:
+        config: Global application configuration.
+        model: Model configuration to use.
+        messages: List of chat messages in OpenAI format.
+
+    Returns:
+        The full generated response as a string.
+
+    Raises:
+        ValueError: If the model type is unsupported.
+    """
     _log_request(model, messages)
 
-    # -------- vLLM ----------------------------------------------------
     if model.model_type == "vllm":
         async with httpx.AsyncClient() as client:
             resp = await client.post(
@@ -58,7 +83,6 @@ async def get_completion(
             _log_response(model, result)
             return result
 
-    # -------- OpenAI --------------------------------------------------
     if model.model_type == "openai":
         client = OpenAI(api_key=config.openai_api_key)
 
@@ -76,15 +100,27 @@ async def get_completion(
     raise ValueError(f"Unsupported model type: {model.model_type}")
 
 
-# ---------------------------------------------------------------------
-# Streaming
-# ---------------------------------------------------------------------
 async def stream_completion(
     config: AppConfig, model: ModelConfig, messages: list[dict]
 ) -> AsyncGenerator[str, None]:
+    """
+    Stream a chat completion from the specified model, yielding tokens one by one.
+
+    This is useful for UIs that want to display text as it's generated.
+
+    Args:
+        config: Global application configuration.
+        model: Model configuration to use.
+        messages: List of chat messages in OpenAI format.
+
+    Yields:
+        A sequence of SSE-style `"data: {json}\n"` formatted strings representing each token.
+
+    Raises:
+        ValueError: If the model type is unsupported.
+    """
     _log_request(model, messages, stream=True)
 
-    # -------- vLLM ----------------------------------------------------
     if model.model_type == "vllm":
         async with httpx.AsyncClient(timeout=None) as client:
             async with client.stream(
@@ -117,17 +153,15 @@ async def stream_completion(
                             full_resp += token
                             yield f"data: {json.dumps({'content': token})}\n"
                     except json.JSONDecodeError:
-                        continue  # ignore malformed keep‑alive lines
+                        continue  # skip malformed keep-alive lines
 
                 _log_response(model, full_resp, stream=True)
         return
 
-    # -------- OpenAI --------------------------------------------------
     if model.model_type == "openai":
         client = OpenAI(api_key=config.openai_api_key)
         full_resp = ""
 
-        # new‑style streaming generator
         for chunk in client.chat.completions.create(
             model=model.name,
             messages=messages,

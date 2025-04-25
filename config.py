@@ -10,12 +10,30 @@ from sentence_transformers import CrossEncoder, SentenceTransformer
 
 
 class ModelType(str, Enum):
+    """
+    Enumeration of supported model backends.
+
+    Attributes:
+        VLLM: A local or hosted VLLM-compatible model.
+        OPENAI: An OpenAI model (e.g., gpt-4o, gpt-4o-mini).
+    """
+
     VLLM = "vllm"
     OPENAI = "openai"
 
 
 @dataclass
 class ModelConfig:
+    """
+    Configuration for a specific LLM model.
+
+    Attributes:
+        name: Unique model identifier (used in model selection).
+        url: Base URL for querying the model (if self-hosted).
+        model_type: Type of model (e.g., VLLM, OPENAI).
+        max_total_tokens: Maximum number of tokens allowed for this model (input + output).
+    """
+
     name: str
     url: str
     model_type: ModelType
@@ -24,6 +42,22 @@ class ModelConfig:
 
 @dataclass
 class AppConfig:
+    """
+    Application configuration loaded from environment variables.
+
+    Attributes:
+        qdrant_url: URL to the Qdrant instance.
+        qdrant_collection: Name of the Qdrant collection to search.
+        models: Dictionary of available models by name.
+        default_model: Name of the default model to use.
+        log_level: Logging level (e.g., logging.INFO).
+        openai_api_key: API key for OpenAI access (if applicable).
+        embedder: SentenceTransformer instance for embedding queries/documents.
+        cross_encoder: CrossEncoder instance for re-ranking vector search results.
+        system_message: System prompt injected into every chat session.
+        max_response_tokens: Token budget for LLM-generated answers.
+    """
+
     qdrant_url: str
     qdrant_collection: str
     models: Dict[str, ModelConfig]
@@ -37,6 +71,18 @@ class AppConfig:
 
     @staticmethod
     def _get_required_env_var(key: str) -> str:
+        """
+        Retrieve a required environment variable or raise an error.
+
+        Args:
+            key: Environment variable name.
+
+        Returns:
+            The value of the environment variable.
+
+        Raises:
+            ValueError: If the variable is missing or empty.
+        """
         value = os.getenv(key)
         if not value:
             raise ValueError(f"{key} environment variable is required.")
@@ -44,6 +90,18 @@ class AppConfig:
 
     @staticmethod
     def _parse_log_level(log_level_name: str) -> int:
+        """
+        Convert log level string to logging constant.
+
+        Args:
+            log_level_name: Log level name (e.g., "debug", "info").
+
+        Returns:
+            Corresponding `logging` module level.
+
+        Raises:
+            ValueError: If the log level name is invalid.
+        """
         log_levels = {
             "debug": logging.DEBUG,
             "info": logging.INFO,
@@ -59,6 +117,18 @@ class AppConfig:
 
     @staticmethod
     def _parse_model_registry(raw: str) -> Dict[str, ModelConfig]:
+        """
+        Parse a JSON string of model configurations into a dictionary.
+
+        Args:
+            raw: JSON string from `VLLM_MODELS` environment variable.
+
+        Returns:
+            Dictionary mapping model names to `ModelConfig` objects.
+
+        Raises:
+            ValueError: If the input JSON is malformed or missing required fields.
+        """
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError as e:
@@ -80,6 +150,27 @@ class AppConfig:
 
     @staticmethod
     def load() -> "AppConfig":
+        """
+        Load application configuration from environment variables.
+
+        Expected environment variables:
+            - QDRANT_URL
+            - QDRANT_COLLECTION
+            - DEFAULT_MODEL
+            - VLLM_MODELS (JSON string list)
+            - OPENAI_API_KEY
+            - EMBEDDING_MODEL
+            - CROSS_ENCODER_MODEL
+            - SYSTEM_MESSAGE
+            - MAX_RESPONSE_TOKENS
+            - LOG_LEVEL
+
+        Returns:
+            Fully initialized `AppConfig` object.
+
+        Raises:
+            ValueError: If required environment variables are missing or invalid.
+        """
         load_dotenv()
         get = AppConfig._get_required_env_var
 
